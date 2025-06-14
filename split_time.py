@@ -29,11 +29,25 @@ class Segment:
     用于存储分片信息的数据类
     注意：这里的 start_time 和 end_time 内部存储为毫秒
     """
-    start_time: float
-    end_time: float
-    start_line_num: int
-    end_line_num: int
-    lines: List[str] = field(default_factory=list)
+    start_time: float = 0.0
+    end_time: float = 0.0
+    start_line_num: int = 0
+    end_line_num: int = 0
+    last_speaker: str = None
+
+    def set_start_time(self, start_time: float):
+        """设置分片的开始时间（毫秒）"""
+        if start_time < 0:
+            self.start_time = 0.0
+        else:
+            self.start_time = start_time
+    
+    def set_end_time(self, end_time: float):
+        """设置分片的结束时间（毫秒）"""
+        if end_time < 0:
+            self.end_time = 0.0
+        else:
+            self.end_time = end_time
 
     @property
     def duration(self) -> float:
@@ -42,7 +56,11 @@ class Segment:
 
     @property
     def line_count(self) -> int:
-        return len(self.lines)
+        return self.end_line_num - self.start_line_num + 1
+
+    @property
+    def notinited(self) -> int:
+        return self.end_line_num <= 0
 
 def find_ffmpeg(ffmpeg_path: Optional[str], console: Console) -> Optional[str]:
     """在系统PATH或用户指定路径中查找ffmpeg可执行文件"""
@@ -86,87 +104,77 @@ def analyze_segments(
     min_duration_ms = min_duration * 1000
     padding_ms = padding * 1000
 
-    # 1. 分析说话人信息
+    # 分析说话人信息
     actors = {event.name for event in subs if event.name and event.name.strip()}
     multi_speaker = len(actors) > 1
-    console.print(f"字幕分析: {'[cyan]检测到多个说话人[/cyan]' if multi_speaker else '[yellow]未检测到多个或有效的说话人信息[/yellow]'}")
-    if multi_speaker:
+    if len(actors) >= 1:
         console.print(f"说话人列表: [green]{', '.join(sorted(list(actors)))}[/green]")
+    else:
+        console.print("[yellow]未检测到有效的说话人信息[/yellow]")
 
+    seg:Segment=None
     segments: List[Segment] = []
-    current_lines = []
-    
+
+    last_end:float = 0.0
+    pad:float=0.0
+    line_num:int=0
+
     for i, event in enumerate(subs):
         line_num = i + 1
-        line_text = f"L{line_num} ({event.name or 'N/A'}): {event.text}"
-        
-        if not current_lines:
-            current_lines.append({'event': event, 'line_num': line_num, 'text': line_text})
-            continue
 
-        should_split = False
-        start_event = current_lines[0]['event']
-        potential_duration = event.end - start_event.start
-
-        if potential_duration >= min_duration_ms:
-            if multi_speaker:
-                last_event = current_lines[-1]['event']
-                if event.name != last_event.name:
-                    should_split = True
-            else:
-                should_split = True
-        
-        if should_split:
-            last_event_in_segment = current_lines[-1]['event']
-            gap = event.start - last_event_in_segment.end
-            
-            start_time = current_lines[0]['event'].start
-            end_time = last_event_in_segment.end
-
-            if gap < (2 * padding_ms):
-                split_point = gap / 2
-                end_time += split_point
-                next_start_time = event.start - split_point
-            else:
-                end_time += padding_ms
-                next_start_time = event.start - padding_ms
-
-            segment = Segment(
-                start_time=start_time,
-                end_time=end_time,
-                start_line_num=current_lines[0]['line_num'],
-                end_line_num=current_lines[-1]['line_num'],
-                lines=[item['text'] for item in current_lines]
-            )
-            segments.append(segment)
-            
-            event.start = next_start_time
-            current_lines = [{'event': event, 'line_num': line_num, 'text': line_text}]
+        gap = event.start - last_end
+        if gap<=0:
+            pad =0
+        elif gap < (2 * padding_ms):
+            # 如果间隙不足以容纳两边的padding，则在中间分割
+            pad = gap / 2
         else:
-            current_lines.append({'event': event, 'line_num': line_num, 'text': line_text})
+            # 间隙足够，各自应用完整的padding
+            pad = gap
 
-    if current_lines:
-        start_event = current_lines[0]['event']
-        end_event = current_lines[-1]['event']
-        
-        segment = Segment(
-            start_time=start_event.start,
-            end_time=end_event.end + padding_ms,
-            start_line_num=current_lines[0]['line_num'],
-            end_line_num=current_lines[-1]['line_num'],
-            lines=[item['text'] for item in current_lines]
-        )
-        segments.append(segment)
+        if seg:
+            seg.set_end_time(last_end+pad)
+        last_end = event.end
 
-    if len(segments) >= 2 and segments[-1].duration < (min_duration_ms / 2):
-        console.print("\n[yellow]检测到最后一个分片过短，正在合并到上一个分片...[/yellow]")
-        last_segment = segments.pop()
-        second_last_segment = segments[-1]
-        
-        second_last_segment.end_time = last_segment.end_time
-        second_last_segment.end_line_num = last_segment.end_line_num
-        second_last_segment.lines.extend(last_segment.lines)
-        console.print("[green]合并完成。[/green]")
+        if not seg:
+            # 如果当前分片为空，则初始化
+            seg = Segment(event.start-padding_ms,event.end,line_num,line_num)
+            if event.name:
+                seg.last_speaker = event.name
+            else:
+                segments.append(seg)
+                seg = Segment(event.start-pad,event.end,line_num,line_num)
+
+        elif seg.duration >= min_duration_ms:
+            if multi_speaker:
+                if seg.last_speaker != event.name:
+                    # 如果是多说话人且当前说话人与上一个分片的说话人不同，则分割
+                    segments.append(seg)
+                    seg = Segment(event.start-pad,event.end,line_num,line_num,event.name)
+                else:
+                    # 如果是多说话人且当前说话人与上一个分片的说话人相同，则继续累积
+                    seg.set_end_time(event.end)
+                    seg.end_line_num = line_num
+                    if event.name:
+                        seg.last_speaker = event.name
+        else:
+            seg.set_end_time(event.end)
+            seg.end_line_num = line_num
+            if event.name:
+                seg.last_speaker = event.name
+
+    if not seg:
+        return segments
+
+    if seg.duration < min_duration_ms and len(segments)>0:
+        console.print("\n[yellow]最后一个分片过短，合并到上一个[/yellow]")
+        segment = segments[-1]
+        segment.end_time = last_end + padding_ms
+        segment.end_line_num = line_num
+        segments[-1] = segment
+    else:
+        seg.set_end_time(event.end+padding_ms)
+        segments.append(seg)
 
     return segments
 
@@ -246,27 +254,27 @@ def main():
     table.add_column("片段", style="dim", width=6, justify="right")
     table.add_column("开始时间", justify="center", style="cyan")
     table.add_column("结束时间", justify="center", style="cyan")
-    table.add_column("时长(秒)", justify="right", style="green")
-    table.add_column("字幕行", justify="center")
+    table.add_column("时长(秒)", justify="right")
+    table.add_column("字幕行", justify="right")
     table.add_column("行数", justify="right")
 
     for i, seg in enumerate(segments):
         start_sec = seg.start_time / 1000.0
         end_sec = seg.end_time / 1000.0
-        duration_sec = seg.duration / 1000.0
+        duration_sec = end_sec - start_sec
         
         start_str = format_time(start_sec)
         end_str = format_time(end_sec)
         duration_str = f"{duration_sec:.2f}"
         line_range = f"{seg.start_line_num}-{seg.end_line_num}"
-        line_count = f"{seg.line_count}"
+        line_count = f"{seg.end_line_num-seg.start_line_num+1}"
         
         table.add_row(str(i+1), start_str, end_str, duration_str, line_range, line_count)
 
     console.print(table)
     # --- 表格打印优化结束 ---
 
-    confirm = input("以上是分片计划。是否继续执行FFmpeg进行切分? (y/n, default=y): ")
+    confirm = input("请确认是否按计划进行切分? (y/n, default=y): ")
     if confirm.lower() == 'n':
         console.print("[yellow]操作已取消。[/yellow]")
         sys.exit(0)
