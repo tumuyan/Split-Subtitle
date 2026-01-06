@@ -141,9 +141,7 @@ def analyze_segments(
             seg = Segment(event.start-padding_ms,event.end,line_num,line_num)
             if event.name:
                 seg.last_speaker = event.name
-            else:
-                segments.append(seg)
-                seg = Segment(event.start-pad,event.end,line_num,line_num)
+            # 无说话人时不再立即添加片段，而是等待达到最小时长再分割
 
         elif seg.duration >= min_duration_ms:
             if multi_speaker:
@@ -157,6 +155,10 @@ def analyze_segments(
                     seg.end_line_num = line_num
                     if event.name:
                         seg.last_speaker = event.name
+            else:
+                # 如果是单说话人或无说话人，达到最小时长就分割
+                segments.append(seg)
+                seg = Segment(event.start-pad,event.end,line_num,line_num,event.name if event.name else None)
         else:
             seg.set_end_time(event.end)
             seg.end_line_num = line_num
@@ -205,6 +207,11 @@ def main():
         "--ffmpeg",
         help="FFmpeg可执行文件的路径。\n如果未提供，脚本将尝试在系统PATH中查找。"
     )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="只生成分片计划，不执行实际的分割操作。"
+    )
     
     args = parser.parse_args()
 
@@ -212,24 +219,32 @@ def main():
     media_path = Path(args.media_file)
     min_duration = args.time
     padding = args.padding
+    dry_run = args.dry_run
 
     if not subtitle_path.is_file():
         console.print(f"[bold red]错误:[/bold red] 字幕文件未找到: {subtitle_path}")
         sys.exit(1)
-    if not media_path.is_file():
+    if not dry_run and not media_path.is_file():
         console.print(f"[bold red]错误:[/bold red] 媒体文件未找到: {media_path}")
         sys.exit(1)
         
-    ffmpeg_exec = find_ffmpeg(args.ffmpeg, console)
-    if not ffmpeg_exec:
-        sys.exit(1)
+    ffmpeg_exec = None
+    if not dry_run:
+        ffmpeg_exec = find_ffmpeg(args.ffmpeg, console)
+        if not ffmpeg_exec:
+            sys.exit(1)
 
     console.print("-" * 50)
     console.print(f"字幕文件: [cyan]{subtitle_path.name}[/cyan]")
     console.print(f"媒体文件: [cyan]{media_path.name}[/cyan]")
-    console.print(f"FFmpeg路径: [cyan]{ffmpeg_exec}[/cyan]")
+    if dry_run:
+        console.print(f"FFmpeg路径: [yellow]跳过检查 (dry-run模式)[/yellow]")
+    else:
+        console.print(f"FFmpeg路径: [cyan]{ffmpeg_exec}[/cyan]")
     console.print(f"最小时长: [bold]{min_duration}[/bold] 秒")
     console.print(f"Padding: [bold]{padding}[/bold] 秒")
+    if dry_run:
+        console.print(f"运行模式: [yellow]dry-run (仅生成计划)[/yellow]")
     console.print("-" * 50)
 
     try:
@@ -277,6 +292,11 @@ def main():
     confirm = input("请确认是否按计划进行切分? (y/n, default=y): ")
     if confirm.lower() == 'n':
         console.print("[yellow]操作已取消。[/yellow]")
+        sys.exit(0)
+
+    if dry_run:
+        console.print("\n[yellow]dry-run模式: 跳过实际分割操作[/yellow]")
+        console.print("[bold]>> 分片计划生成完成。[/bold]")
         sys.exit(0)
 
     output_dir = media_path.parent / f"{media_path.stem}_segments"
